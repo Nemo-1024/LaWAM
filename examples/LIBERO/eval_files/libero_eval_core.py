@@ -60,7 +60,9 @@ class EvalArgs:
     sim_alpha: float = 0.5
     sim_cmap: str = "jet"
     max_tasks: Optional[int] = None
+    task_ids: Optional[str] = None
     log_path: Optional[str] = None
+    category_result_name: Optional[str] = None
     benchmark_variant: str = "libero"
     enable_category_aggregation: Optional[bool] = None
     num_workers: int = 1
@@ -634,8 +636,31 @@ def _run_single_episode(
             close_fn()
 
 
-def _task_id_list(task_suite: Any, num_tasks_to_run: int) -> list[int]:
-    return list(range(int(num_tasks_to_run)))
+def _parse_task_ids(raw_task_ids: str | None, *, num_tasks_in_suite: int) -> list[int] | None:
+    if raw_task_ids is None or str(raw_task_ids).strip() == "":
+        return None
+    task_ids: list[int] = []
+    for part in str(raw_task_ids).replace(",", " ").split():
+        task_id = int(part)
+        if task_id < 0 or task_id >= int(num_tasks_in_suite):
+            raise ValueError(
+                f"Task id {task_id} is out of bounds for suite with {num_tasks_in_suite} tasks."
+            )
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+    if not task_ids:
+        raise ValueError("`task_ids` did not contain any task ids.")
+    return task_ids
+
+
+def _task_id_list(args: EvalArgs, *, num_tasks_in_suite: int) -> list[int]:
+    selected_task_ids = _parse_task_ids(args.task_ids, num_tasks_in_suite=num_tasks_in_suite)
+    if selected_task_ids is not None:
+        return selected_task_ids
+    num_tasks_to_run = int(num_tasks_in_suite)
+    if args.max_tasks is not None:
+        num_tasks_to_run = min(int(num_tasks_in_suite), int(args.max_tasks))
+    return list(range(num_tasks_to_run))
 
 
 def _finalize_results(
@@ -692,7 +717,8 @@ def _finalize_results(
 
     suite_json_path = None
     if category_aggregation_enabled:
-        suite_json_path = log_output_dir / f"{args.task_suite_name}.json"
+        category_result_name = args.category_result_name or args.task_suite_name
+        suite_json_path = log_output_dir / f"{safe_segment(category_result_name)}.json"
         with suite_json_path.open("w", encoding="utf-8") as f:
             json.dump(category_summary, f, ensure_ascii=False, indent=2)
 
@@ -707,6 +733,7 @@ def _finalize_results(
         "num_trials_per_task": int(args.num_trials_per_task),
         "seed": int(args.seed),
         "max_tasks": None if args.max_tasks is None else int(args.max_tasks),
+        "task_ids": args.task_ids,
         "category_summary_path": str(suite_json_path) if suite_json_path is not None else None,
     }
     with (run_output_dir / "summary.json").open("w", encoding="utf-8") as f:
@@ -769,7 +796,7 @@ def _serial_eval(
     run_output_dir: Path,
     log_output_dir: Path,
     task_suite: Any,
-    num_tasks_to_run: int,
+    task_ids_to_run: list[int],
     task_metadata: dict[int, tuple[str | None, str]],
 ) -> None:
     client_model = _build_model_client(args)
@@ -777,7 +804,7 @@ def _serial_eval(
     completed_tasks = 0
 
     try:
-        for task_id in _task_id_list(task_suite, num_tasks_to_run):
+        for task_id in task_ids_to_run:
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             if len(initial_states) == 0:
@@ -802,7 +829,7 @@ def _serial_eval(
             _log_suite_progress(
                 suite_name=args.task_suite_name,
                 completed_tasks=completed_tasks,
-                total_tasks=num_tasks_to_run,
+                total_tasks=len(task_ids_to_run),
                 episode_results=episode_results,
             )
     finally:
@@ -1120,7 +1147,7 @@ def _coordinated_parallel_eval(
     run_output_dir: Path,
     log_output_dir: Path,
     task_suite: Any,
-    num_tasks_to_run: int,
+    task_ids_to_run: list[int],
     task_metadata: dict[int, tuple[str | None, str]],
 ) -> None:
     client_model = _build_model_client(args)
@@ -1137,9 +1164,9 @@ def _coordinated_parallel_eval(
     for proc in processes:
         proc.start()
 
-    total_tasks = int(num_tasks_to_run)
+    total_tasks = len(task_ids_to_run)
     work_items: list[EpisodeWorkItem] = []
-    for task_id in _task_id_list(task_suite, num_tasks_to_run):
+    for task_id in task_ids_to_run:
         initial_states = task_suite.get_task_init_states(task_id)
         if len(initial_states) == 0:
             raise RuntimeError(f"Task {task_id} returned empty initial states.")
@@ -1541,13 +1568,11 @@ def eval_libero(args: EvalArgs) -> None:
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = int(task_suite.n_tasks)
 
-    num_tasks_to_run = num_tasks_in_suite
-    if args.max_tasks is not None:
-        num_tasks_to_run = min(num_tasks_in_suite, int(args.max_tasks))
+    task_ids_to_run = _task_id_list(args, num_tasks_in_suite=num_tasks_in_suite)
     _log_suite_progress(
         suite_name=args.task_suite_name,
         completed_tasks=0,
-        total_tasks=num_tasks_to_run,
+        total_tasks=len(task_ids_to_run),
         episode_results=[],
     )
 
@@ -1560,7 +1585,7 @@ def eval_libero(args: EvalArgs) -> None:
             run_output_dir=run_output_dir,
             log_output_dir=log_output_dir,
             task_suite=task_suite,
-            num_tasks_to_run=num_tasks_to_run,
+            task_ids_to_run=task_ids_to_run,
             task_metadata=task_metadata,
         )
         return
@@ -1571,6 +1596,6 @@ def eval_libero(args: EvalArgs) -> None:
         run_output_dir=run_output_dir,
         log_output_dir=log_output_dir,
         task_suite=task_suite,
-        num_tasks_to_run=num_tasks_to_run,
+        task_ids_to_run=task_ids_to_run,
         task_metadata=task_metadata,
     )
